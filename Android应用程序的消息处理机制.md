@@ -173,8 +173,122 @@ static jlong android_os_MessageQueue_nativeInit(JNIEnv* env, jclass clazz){
 
 &#8195;&#8195;gMessageQueueClassInfo是一个全局变量，它的定义如下所示。
 
+&#8195;&#8195;***frameworks/base/core/jni/android_os_MessageQueue.cpp***
+```c++
+static struct {
+    jfieldID mPtr; // native object attached to the DVM MessageQueue
+    jmethodID dispatchEvents;
+} gMessageQueueClassInfo;
+```
 
+&#8195;&#8195;它的成员变量mPtr指向了Java层的MessageQueue类的mPtr属性，成员变量dispatchEvents指定了MessageQueue类的成员函数<html><code>private int dispatchEvent(int fd, events)</code></html>；
 
+&#8195;&#8195;从全局变量gMessageQueueClassInfo的定义就可以看出，函数android_os_MessageQueue_nativeInit实际上是将一个C++层的NativeMessageQueue对象的指针保存在Java层的MessageQueue对象的成员变量mPtr中，从而可以将他们关联起来。
+
+&#8195;&#8195;一个NativeMessageQueue对象在创建的过程中，又会在内部创建一个C++层的Looper对象，如下所示。
+
+&#8195;&#8195;***frameworks/base/core/jni/android_os_MessageQueue.cpp***
+```c++
+1 NativeMessageQueue:NativeMessageQueue():mPollEnv(NULL),
+2     mPollObj(NULL),mExceptionObj(NULL) 
+3 {
+4     mLooper = Looper::getForThread();
+5     if (mLooper == NULL) {
+6         mLooper = new Looper(false);
+7         Looper::setForThread(mLooper);
+8     }
+9 }
+```
+
+&#8195;&#8195;第4行代码首先调用C++ 层的Looper类的静态成员函数getForThread来检查是否已经为当前线程创建过一个C++ 层的Looper对象。如果没有创建过，那么接着第6行代码首先创建一个C++ 层的Looper对象，并且将它保存在NativeMessageQueue类的成员变量mLooper中，然后在第7行代码再调用C++ 层的Looper类的静态成员函数setForThread将当前线程关联起来。
+
+&#8195;&#8195;一个C++ 层的Looper对象在创建的过程中，又会在内部创建一个管道，如下所示。
+
+&#8195;&#8195;***system/core/libutils/Looper.cpp***
+```C++
+01 Looper::Looper(bool allowNonCallbacks):
+02        mAllowNonCallbacks(allowNonCallbacks),
+03        mSendingMessage(false),
+04        mPolling(false),
+05        mEpollFd(-1),
+06        mEpollRebuildRequired(false),
+07        mNextRequestSeq(0),
+08        mResponseIndex(0),
+09        mNextMessageUptime(LLONG_MAX) {
+10     mWakeEventFd = eventfd(0, EFD_NONBLOCK);
+11     LOG_ALWAYS_FATAL_IF(mWakeEventFd < 0, "Could not make  wake event fd. errno=%", errno);
+
+12     AutoMutex _l(mLock);
+13     rebuildEpollLocked();
+14 }
+15 
+16 void Looper::rebuildEpollLocked() {
+17     // close old epoll instance if we have one.
+18     if (mEpollFd >= 0) {
+19        close(mEpollFd);
+20     }
+21 
+22     // Allocate the new epoll instance and register the wake pip.
+23     mEpollFd = epoll_create(EPOLL_SIZE_HINT);
+24     
+25     struct epoll_event eventItem;
+26     memset(&eventItem, 0, sizeof(epoll_event)); // zero out unused memebers of data field union
+27     eventItem.events = EPOLLIN;
+28     eventItem.data.fd = mWakeEventFd;
+29     int result = epoll_ctl(mEpllFd, EPOLL_CTL_ADD, mWakeEventFd, &eventITem);
+30     
+31     for (size_t i = 0; i < mRequests.size(); i++) {
+32         const Request& request = mRequests.valueAt(i);
+33         struct epoll_event eventItem;
+34         reqeust.initEventItem(&eventITem);
+35
+36         int epollResult = epoll_ctl(mEpollFd, EPOLL_CTL_ADD, request.fd, &eventItem);
+37         if(epollResult < 0) {
+38             ALOGE("Error adding epoll events for fd %d while rebuilding epoll set, errno=%", request.fd, errno);
+39         }
+40     }
+41 }
+```
+
+&#8195;&#8195;第10行，创建eventfd并赋值给mWakeEventFd，在以前的Android版本上，这里创建的是pipe管道。evnetfd是较新的API，被用作一个事件等待/响应，实现了线程之间事件通知。
+
+&#8195;&#8195;rebuildEpollLocked中通过epoll_create创建了一个epoll专用的文件描述符，EPOLL_SIZE_HINT表示mEpollFd上能监控的最大文件描述符。最后调用epoll_ctl监控mWakeEventFd文件描述符的EPOLLIN事件，即当eventfd中有内容可读时，就唤醒当前正在等待的线程。
+
+&#8195;&#8195;Linux系统的epoll机制是为了同时监听多个文件描述的IO读写事件而设计的，它是一个多路复用IO接口，类似于Linux系统的select机制，但是它是select机制的增强版。如果一个epoll实例监听了大量的文件描述符的IO读写事件，但是只有少量的文件描述符是活跃的，即只有少量的文件描述符会发生IO读写事件，那么这个epoll实例可以显著地减少CPU的使用率，从而提供系统的并发处理能力。
+
+## 线程消息循环过程
+&#8195;&#8195;一个Android应用程序线程的消息队列创建完成之后，就可以调用Looper类的静态成员函数loop使它进入到一个消息循环中，如下图所示。
+
+![image](https://note.youdao.com/yws/api/personal/file/B32CD41A6A7B4126A157DC31A3174FC6?method=download&shareKey=62570b83945e81551ee5113f095cc04a)
+
+&#8195;&#8195;这个过程一共分为7个步骤，下面我们来分析一下每一个步骤。
+
+**Step 1: Lopper.loop**
+&#8195;&#8195;***frameworks/base/core/java/android/os/Looper.java***
+```java
+public class Looper {
+    ......
+    
+    public static final void loop() {
+        final Looper me = myLooper();
+        if (me == null) {
+            throw new RuntimeException("No Looper; Looper.prepare() wasn't called on this thread.")
+        }
+        final MessageQueue queue = me.mQueue;
+        ......
+        for (;;) {
+            Message msg = queue.next(); // might block
+            if (msg == null) {
+                // No message indicates that the message queue is quitting.
+                return;
+            }
+            ......
+        }
+    }
+    
+    ......
+}
+```
 
 
 
