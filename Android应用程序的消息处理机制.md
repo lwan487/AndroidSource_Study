@@ -1,3 +1,4 @@
+[TOC]
 &#8195;&#8195;我们知道，Android应用程序是通过消息来驱动的。Android应用程序的每一个线程在启动时，都可以首先在内部创建一个消息队列，然后在进入到一个无限循环中，不断检查他的消息队列是否有新的消息需要处理。如果有新的消息需要处理，那么线程就会将它从消息队列中取出来，并且对它进行处理；否则，线程就进入睡眠等待状态，知道有新的消息需要处理为止。这样可以通过消息来驱动Android应用程序的执行了。
 
 &#8195;&#8195;我们将线程的生命周期划分为创建消息队列和进入消息循环两个阶段，其中，消息循环阶段又可以划分为发送消息和处理消息两个子阶段，它们是交替进行的。
@@ -17,9 +18,9 @@
 
 &#8195;&#8195;Java层中的每一个MessageQueue对象还有一个类型为Message的成员变量mMessages，用来描述一个消息队列，可以调用MessageQueue类的成员函数enqueueMessage来往里面添加一个消息。
 
-&#8195;&#8195;C++层中的Looper队友两个类型为int的成员变量**mWakeReadPipeFd**和**mWakeWritePipeFd**，分别用来描述一个管道的的读端文件描述符和写端文件描述符。当一个线程的消息队列没有消息需要处理时，它就会在这个管道的读端文件描述符上进行睡眠等待，知道其他线程通过这个管道的写端文件描述符来唤醒它为止。
+&#8195;&#8195;C++层中的Looper对象有一个类型为int的成员变量**mWakeEventFd**的文件描述符，Linux的event机制在发现mWakeEventFd文件描述符上有事件发生时，会从Looper类的pollInner方法中的epoll_wait唤醒，继续处理消息。
 
-&#8195;&#8195;当调用Java层的Looper类的静态成员函数prepareMainLooper或者prepare来为一个线程创建一个消息队列时，Java层的Looper类就会在这个线程中创建一个Looper对象和一个MessageQueue对象。在创建Java层的MessageQueue对象的过程中，又会调用自身成员变量nativeInit在C++ 层中创建一个NativeMessageQueue对象和一个Looper对象。在创建C++层的Looper对象时，又会创建一个管道，这个管道的读端文件描述符和写端描述符就保存在它的成员变量mWakeReadPipedFd和mWakeWritePipedFd中。
+&#8195;&#8195;当调用Java层的Looper类的静态成员函数prepareMainLooper或者prepare来为一个线程创建一个消息队列时，Java层的Looper类就会在这个线程中创建一个Looper对象和一个MessageQueue对象。在创建Java层的MessageQueue对象的过程中，又会调用自身成员变量nativeInit在C++ 层中创建一个NativeMessageQueue对象和一个Looper对象。在创建C++层的Looper对象时，创建文件描述符mWakeEventFd。
 
 &#8195;&#8195;Java层中的Looper类的成员函数loop、MessageQueue类的成员函数nativePollOnce和nativeWake，以及C++层中的NativeMessageQueue类的成员函数pollOnce和wake、Looper类的成员函数pollOnce和wake，是与线程的消息循环、消息发送和消息处理相关的。
 
@@ -266,30 +267,432 @@ static struct {
 **Step 1: Lopper.loop**
 &#8195;&#8195;***frameworks/base/core/java/android/os/Looper.java***
 ```java
-public class Looper {
-    ......
-    
-    public static final void loop() {
-        final Looper me = myLooper();
-        if (me == null) {
-            throw new RuntimeException("No Looper; Looper.prepare() wasn't called on this thread.")
-        }
-        final MessageQueue queue = me.mQueue;
-        ......
-        for (;;) {
-            Message msg = queue.next(); // might block
-            if (msg == null) {
-                // No message indicates that the message queue is quitting.
-                return;
-            }
-            ......
-        }
-    }
-    
-    ......
-}
+01 public class Looper {
+02     ......
+03     
+04     public static final void loop() {
+05         final Looper me = myLooper();
+06        if (me == null) {
+07             throw new RuntimeException("No Looper; Looper.prepare() wasn't called on this thread.")
+08         }
+09         final MessageQueue queue = me.mQueue;
+10        ......
+11        for (;;) {
+12            Message msg = queue.next(); // might block
+13            if (msg == null) {
+14                // No message indicates that the message queue is quitting.
+15                return;
+16            }
+17            ......
+18        }
+19     }
+20    
+21     ......
+22 }
+```
+&#8195;&#8195;第5行到第9行代码首先获得当前线程的消息队列，接着第11行到第18行的for循环不断地检查这个消息队列中是否有新的消息需要处理。如果有新的消息需要处理，那么第12行代码获得的Message对象msg就不等于null；否则当前线程就会在MessageQueue类的成员函数next中进入睡眠等待状态，直到有新的消息需要处理为止。
+
+**Step 2：MessageQueue.next**
+&#8195;&#8195;***frameworks/base/core/java/android/os/MessageQueue.java***
+
+```java
+01 public class MessageQueue {
+02     ......
+03    
+04     Message next() {
+05        // Return here if the message loop has already quit and been disposed
+06        // This can happen if the application tries to restart a looper after quit
+07        // which is not supported
+08        final long ptr = mPtr;
+09        if (ptr == 0) {
+10            return null;
+11        }
+12         
+13        int pendingIdleHandlerCount = -1; // -1 only during first iteration
+14        int nextPollTimeoutMillis = 0;
+15         
+16        for (;;) {
+17            if (nextPollTimeoutMillis != 0) {
+18                 Binder.flushPendingCommands();
+19            }
+20            
+21             nativePollOnce(ptr, nextPollTimeoutMillis);
+22            
+23             synchronized(this) {
+24                 // Try to retrieve  the next message. Return if found.
+25                 final long now = SystemClock.uptimeMillis();
+26                 Message prevMsg = null;
+27                 Message msg = mMessages;
+28                 if (msg != null && msg.target == null) {
+29                     // Started by a barrier. Find the next asynchronous message in queue.
+30                     do {
+31                         prevMsg = msg;
+32                         msg = msg.next;
+33                     } while (msg != null && !msg.isAsynchronous());
+34                 }
+35                 if (msg != null) {
+36                     if (now < msg.when) {
+37                         // Next message is not ready.Set a timeout to wake up when it is ready.
+38                         nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.Max_VALUE);
+39                     } else {
+40                         // Got a message
+41                         mBlocked = false;
+42                         if (prevMsg != null) {
+43                             prevMsg.next = msg.next;
+44                         } else {
+45                             mMessages = msg.next;
+46                         }
+47                         msg.next = null;
+48                         if (DEBUG) Log.v(TAG, "Returning message:" + msg);
+49                         msg.markInUse();
+50                         return msg;
+51                     }
+52                 } else {
+53                     // No more messages.
+54                     nextPollTimeoutMillis = -1;
+55                 }
+56                 
+57                 if (mQuitting) {
+58                     dispose();
+59                     return null;
+60                 }
+61                
+63                 ......
+64                 // Get the idle handlers
+65                 ......
+66             }
+67            
+68             // Run the idle handlers.
+69             ......
+
+70             // Reset the idle handler count to 0 so we do not run them again.
+71             pendingIdleHandlerCount = 0;
+        
+72             // While calling an idle handler, a new message could have been delivered
+73             // so go back and look again for a pending message without waiting.
+74             nextPollTimeoutMillis = 0;
+75         }
+76     }
+
+77     ......
+78 }
+```
+&#8195;&#8195;第13行代码定义了一个变量pendingIdleHandlerCount,用来保存注册到消息队列中的空闲消息处理器（IdleHandler）的个数，它们是在第64行省略的代码中计算的。当线程发现它的消息队列没有新的消息需要处理时，不是马上进入睡眠等待状态，而是调用注册到它的消息队列中的IdleHandler对象的成员函数queueIdle，以便有机会在线程空闲时执行一些操作。这些IdleHandler对象的成员函数queueIdle在第69行省略的代码中调用，在后面的章节中，我们分析。
+
+&#8195;&#8195;第14行代码定义了另外一个变量nextPollTimeoutMillis。用来描述当消息队列中没有新的消息需要处理时，当前线程需要进入睡眠等待状态的时间。如果变量nextPollTimeoutMillis的值等于0，那么就表示即使消息队列中没有新的消息需要处理，当前线程需要进入睡眠等待状态的时间。如果nextPollTimeoutMillis的值等于0，那么就表示即使消息队列中没有新的消息需要处理，当前线程也不要进入睡眠等待状态。如果变量nextPollTimeoutMillis的值等于-1，那么就表示当消息没有新的消息需要处理时，当前线程需要无限地处理睡眠等待状态，直到它被其他线程唤醒为止。
+
+&#8195;&#8195;第16行到第75行的for循环不断地调用成员函数nativePollOnce来检查当前线程的消息队列中是否有新的消息需要处理。
+
+```java
+注意：
+在调用成员函数nativePollOnce时，当前线程可能会进入睡眠等待状态，那么进入睡眠等待状态的时间就由第二个参数nextPollTimeoutMillis来指定。
 ```
 
+&#8195;&#8195;MessageQueue类内部有一个类型为Mesage的成员变量mMesages，用来描述当前线程需要处理的消息。当前线程从成员函数nativePollOnce返回来之后，如果它有新的消息需要处理，即MessageQueue类的成员变量mMessages不等于null，那么接下来第36行到56行代码就会对它进行处理，否则，第54行代码就会将变量nextPollTimeoutMillis的值设置为-1，表示当前线程下次在调用成员函数nativePollOnce时，如果没有新的消息需要处理，那么就要无限地处于睡眠等待状态，直到它被其他线程唤醒为止。
 
+&#8195;&#8195;第36行代码比较MessageQueue类的成员变量mMessages所描述的消息的处理时间大于系统的当前时间，那么说明当前线程不需要马上对它进行处理。因此，第38行代码会计算当前线程下一次调用成员函数nativePollOnce时，如果没有新的消息需要处理，那么当前线程需要进入睡眠等待状态的时间，以便可以在指定的时间点对接下来的消息进行处理。否则，第40行到51行代码就会将它返回给上一步处理，并且将mMessageQueue类的成员变量mMessages重新指向下一个需要处理的消息。
+
+&#8195;&#8195;当前线程执行到第69行代码时，就说明它目前没有新的消息需要处理，于是接下来它就会重新执行第16行到75行的for循环等待下一个需要处理的消息。这时候当前线程需要进入睡眠等待状态的时间保存在变量nextPollTimeoutMillis中。不过，在进入睡眠等待状态前，当前线程会分发一个线程空闲消息给那些已经注册到消息队列中的IdleHandler对象处理，如69行省略的代码所示。
+
+&#8195;&#8195;第74行代码是在注册到消息队列中的IdleHandler对象处理完成了一个线程空闲消息后执行的，它主要是将nextPollTimeoutMillis的值重新设置为0，表示当前线程接下来在调用成员函数nativePollOnce时，不可以进入睡眠等待状态。由于注册的IdleHandler对象在处理线程空闲消息期间，其他线程可能已经向当前线程的消息队列发了一个或者若干个消息，因此，这时候当前线程就不能够在成员函数nativePollOnce中进入睡眠等待状态，而是要马上返回来检查它的消息队列中是否有新的消息需要处理。
+
+```java
+第16行到75行的for循环中，每一次调用成员函数nativePollOnce之前，第9行的if语句都会检查变量nextPollTimemoutMillis的值是否等于0。如果不等于0，那么就说明当前线程会在成员函数nativePollOnce中进入睡眠等待状态，这时候低18行代码就会调用Binder类的静态成员函数fushPendingCommands来处理那些正在等待处理的Binder进程间信请求，避免它们长时间得不到处理。
+```
+
+**Step 3: MessageQueue.nativePollOnce**
+```java
+frameworks/base/core/jni/android_os_MessageQueue.cpp
+1 static void android_os_MessageQueue_nativePollOnce(JNIEnv* env, jclass clazz, jlong ptr) {
+2     NativeMessageQueue* nativeMessageQueue = reinterpret_cast<NativeMessageQueue*>(ptr);
+3     nativeMessageQueue->pollONce(env, obj, timeoutMillis);
+4 }
+```
+&#8195;&#8195;参数obj指向了一个Java层的MessageQueue对象，而参数ptr指向了这个MessageQueue对象的成员变量mPtr。从前面的内容可以知道，MessageQueue类的成员变量mPtr保存的是一个C++层的NativeMessageQueue对象地址。因此，第3行代码就可以安全地将参数ptr转换成一个NativeMessageQueue对象，接着第4行代码再调用这个NativeMessageQueue对象的成员函数pollOnce来检查当前线程是否有新的消息需要处理。
+
+**Step 4: NativeMessageQueue.pollOnce**
+```java
+frameworks/base/core/jni/android_os_MessageQueue.cpp
+01 void NativeMessageQueue:pollOnce(JNIEnv* env, jobject pollOjb, int timeoutMillis) {
+02     mPollEnv = env;
+03     mPollObj = pollObj;
+04     mLooper->pollOnce(timeoutMills);
+05     mPollObj = NULL;
+06     mPollEnv = NULL;
+    
+07     if (mExceptionObj) {
+08         env->Throw(mExceptionObj);
+09         env->DeleteLocalRef(mExceptionObj);
+10         mExceptionObj = NULL:
+11     }
+12 }
+```
+
+&#8195;&#8195;从前面的内容可以知道，NativeMessageQueue类的成员变量mLooper指向一个C++层的Looper对象，第4行代码调用它的成员函数pollOnce来检查当前线程是否有新的消息需要处理。
+
+**Step 5:Looper.pollOnce**
+```java
+system/core/libutils/Looper.cpp
+01 int Looper:pollOnce(int timeoutMillis, int* outFd, int * outEvents, void** outData) {
+02     int result = 0;
+03     for (;;) {
+04         ......
+05        
+06         if (result != 0) {
+07             ......
+08            
+09             return result;
+10         }
+11
+12         result = pollInner(timeoutMillis);
+13     }
+14 }
+```
+
+&#8195;&#8195;第3行到第13行的for循环不断地调用成员函数pollInner来检查当前线程是否有新的消息需要处理。如果有新的消息需要处理，那么成员函数pollInner的返回值就不会等于0，这时候第9行代码就会跳出第3行到第13行的for循环，以便当前线程可以对新的消息进行处理。
+
+**Step 6: Looper:pollInner**
+```java
+system/core/libutils/Looper.cpp
+01 int Looper:pollInner(int timeoutMills) {
+02     ......
+03    
+04     int result = POLL_WAKE;
+05     ......
+06     
+07     struct epoll_event eventItems[EPOLL_MAX_EVENTS];
+08     int eventCount = epoll_wait(mEpollFd, eventItems, EPOLL_MAX_EVENTS, timeoutMillis);
+09     ......
+10     
+11     for (int i = 0; i < eventCount; i++) {
+12         int fd = eventItems[i].data.fd;
+13         uint32_t epollEvents = eventItems[i].events;
+14         if (fd == mWakeEventFd) {
+15             if (epollEvents & EPOLLIN) {
+16                 awoken();
+17             }
+18             ......
+19         }
+20         ......
+21     }
+22     ......
+23     
+24     return result;
+25 }
+```
+
+&#8195;&#8195;在前面的描述中，我们为当前线程在C++ 层创建一个epoll实例，并且将它的文件描述符保存在C++层的Looper类的成员变量mEpollFd中，同时mWakeEventFd加入到epoll监听队列中。
+
+&#8195;&#8195;第8行代码调用函数epoll_wait来监听注册在前面所创建的epoll实例中的Event。如果mWakeEventFd没有发生Event事件，那么当前线程就会在函数epoll_wait中进入睡眠等待状态，等待的事件由最后的一个参数timeoutMillis来指定。
+
+&#8195;&#8195;从函数epoll_wait返回来之后，接下来第11行到第21行的for循环就检查是哪一个Event发生了事件。第14行的if语句检查mWakeEventFd是否发生了Linux的Event事件。如果是，并且它发生了Linux的Event的类型为EPOLLIN，即第15行的if语句为true，那么这个时候就说明其他线程向与当前线程所关联的写入了一个新的数据。
+
+&#8195;&#8195;第16行代码调用成员函数awoken将与当前线程所关联的一个关联的数据读出来，以便当前线程下一次可以重新在这个管道上等待其他线程向它的消息队列发送一个新的消息。
+
+**Step 7: Looper.awoken**
+```java
+system/core/libutils/Looper.cpp
+1 void Looper::awoken() {
+2     ......
+3     
+4     uint64_t counter;
+5     TEMP_FAILURE_RETRY(read(mWakeEventFd, &counter, sizeof(uint64_t));
+6 }
+```
+
+&#8195;&#8195;第5行代码调用函数read将与当前关联的一个管道的数据读出来。从这里可以看出，当前线程根本不关心写入到与它所关联的管道的数据是什么，它只是简单地将这些数据读出来，以便可以清理这个管道中的旧数据。这样当前线程在下一次消息循环时，如果没有新的消息需要处理，那么它就可以通过监听这个管道的IO写事件进入睡眠等待状态，直到其他线程向它的消息队列发送了一个新的消息为止。
+
+&#8195;&#8195;假设当前线程没有新的消息需要处理，那么它就会在前面Step 6中通过调用函数epoll_wait进入睡眠等待状态，直到其他线程向它的消息队列发送了一个新的消息为止。接下来，继续分析其他线程向当前线程的消息队列发送消息的过程。
+
+## 线程消息发送过程
+
+&#8195;&#8195;Android系统提供了一个Handler类，用来向一个线程的消息队列发送一个消息，它的实现下图：
+
+![image](https://note.youdao.com/yws/api/personal/file/6C49AB0A33EE4935ADB6DA229CA6BDE9?method=download&shareKey=546c008c354b33536bcf4a66d4d445c9)
+
+&#8195;&#8195;Handler类内部有mLooper和mQueue两个成员变量，它们分别指向一个Looper对象和一个MessageQueue对象。Handler类还有sendMessage和handleMessage两个成员函数，其中，成员函数sendMessage用来向成员变量mQueue所描述的一个消息队列发送一个消息；而成员函数handleMessage用来处理这个消息，并且它是在与成员变量mLooper所关联的线程中被调用的。
+
+&#8195;&#8195;使用Handler类的默认构造函数来创建一个Handler对象，这时候它的成员变量mLooper和mQueue就会分别指向与当前线程所关联的一个Looper对象和一个MessageQueue对象，如下所示：
+```java
+01 frameworks/base/core/java/android/os/Handler.java
+02 public class Handler {
+03     ......
+04     public Handler(){
+05         mLooper = Looper.myLooper();
+06         ......
+07         
+08         mQueue = mLooper.mQueue;
+09         ......
+10     }
+11     
+12     final MessageQueue mQueue;
+13     final Looper mLooper;
+14     ......
+15 }
+```
+
+&#8195;&#8195;从Handler类的成员函数sendMessage开始，分析向一个线程的消息队列发送一个消息的过程，如下图所示：
+![image](https://note.youdao.com/yws/api/personal/file/F5EEB128D345412B832A67099027643A?method=download&shareKey=6139f3dfeb2abf1bdddd76fbb0b28b79)
+
+&#8195;&#8195;这个过程一共分为5个步骤，下面分析每一个步骤：
+
+**Step 1: Handler.sendMessage**
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class handler {
+02     ......
+03     
+04     public final boolean sendMessage(Message msg) {
+05         return sendMessageDelayed(msg, 0);
+06     }
+07     
+08     public final boolean sendMessageDelayed(Message msg, long delayMillis) {
+09         if (delayMillis < 0) {
+10             delayMillis = 0;
+11         }
+12         return sendMessageAtTime(msg, SystemClock.uptimeMillis() + delayMillis);
+13     }
+14     
+15     public boolean sendMessageAtTime(Message msg, long uptimeMillis) {
+16         MessageQueue queue = mQueue;
+17         if (queue == null) {
+18             RuntimeException e = new RuntimeException(this + " sendMessageAtTime() called with no mQueue");
+19             Log.w("Looper", e.getMessage(), e);
+20             return false;
+21         }
+22         return enqueueMessage(queue, msg, uptimeMillis);
+23     }
+24     
+25     ......
+26
+27     private boolean enqueueMessage(MessageQueue queue, Message msg, long uptimeMillis) {
+28          msg.target = this;
+29          if (mAsynchronous) {
+30               msg.setAsynchronous(true);
+31          }
+32          return queue.enqueueMessage(msg, uptimeMills);
+33     }
+34        
+35     ......
+36 }
+```
+
+**Step 2: MessageQueue.enqueueMessage**
+```java
+frameworks/base/core/java/android/os/MessageQueue.java
+01 public class MessageQueue {
+02     ......
+03     
+04     boolean enqueueMessage(Message msg, long when) {
+05         ......
+06         
+07         synchronized(this) {
+08             ......
+09             
+10             msg.markInUse();
+11             msg.when = when;
+12             Message p = mMessages;
+13             if (p == null || when == 0 || when < p.when){
+14                 // New head, wake up the event queue if blocked
+15                 msg.next = p;
+16                 mMessages = msg;
+17                 neekWake = mBlocked;
+18             } else {
+19               // Inserted within the middle of the queue. Usually we don't have to wake
+20                 // up the event queue unless there is a barrier at the head of the queue
+21                 // and the message is the earliest asynchronous message in the queue.
+22                 needWake = mBlocked && p.target == null && msg.isAsychronous();
+23                 Message prev;
+24                 for (;;) {
+25                     prev = p;
+26                     p = p.next;
+27                     if (p == null || when < p.when) {
+28                         break;
+29                     }
+30                     if (needWake && p.isAsynchronous()) {
+31                         needWake = false;
+32                     }
+33                 }
+34                 msg.next = p; // invariant: p == prev.next
+35                 prev.next = msg;
+36             }
+37             
+38             // We can assume mPtr != 0 because mQuitting is false.
+39             if (needWake) {
+40                 nativeWake(mPtr);
+41             }
+42         }
+43     }
+44     return true;
+45 }
+```
+
+&#8195;&#8195;由于一个消息队列中的消息是按照它们的处理时间从小到大的顺序来排序的，因此，当我们将一个消息发送到一个消息队列时，需要先根据这个消息的处理时间找到它在目标消息队列的合适位置，然后再将它插入到目标消息队列中。
+
+&#8195;&#8195;分四种情况来讨论如何将一个消息插入到一个目标消息队列中。
+1. 目标消息队列是一个空队列。
+2. 插入的消息的处理时间等于0。
+3. 插入的消息的处理时间小于保存在目标消息队列头的消息的处理时间。
+4. 插入的消息的处理时间大于等于保存在目标消息队列头的消息的处理时间。
+
+&#8195;&#8195;对于前面三种情况来说，要插入的消息都需要保存在目标消息队列的头部，如第15行到第17行代码所示。
+
+```
+如果一个消息的处理时间等于0，那么就说明这是一个优先级最高的消息，因此我们需要将它保存在目标消息队列的头部，以便它可以优先得到处理。
+```
+
+&#8195;&#8195;对于最后一种情况来说，要插入的消息需要保存在目标消息队列中间的某一个位置上，如第19行到第35行代码所示，其中，这个位置是通过第24行到第33行的for循环找到的。
+
+```
+如果要插入的消息的处理时间与目标消息队列中的某一个消息的处理时间相同，那么后来插入的消息会被保存在后面，这样就可以保证先发送的消息可以先获得处理。
+```
+&#8195;&#8195;一个线程将一个消息插入到一个目标消息队列之后，可能需要将目标线程唤醒，这需要分两种情况来讨论。
+1. 插入的消息在目标消息队列中间。
+2. 插入的消息在目标消息队列头部。
+
+&#8195;&#8195;对于第一种情况来说，由于保存在目标消息队列头部的消息没有发生变化，因此，当线程无论如何都不需要对目标线程执行唤醒操作，这时候第22行代码就会将变量needWake的值设置为false。
+
+&#8195;&#8195;对于第二种情况来说，由于保存在目标消息队列头部的消息发生了变化，因此，当前线程就需要将目标线程唤醒，以便它可以对保存在目标消息队列头部的新消息进行处理。但是，如果这时候目标线程不是正处于睡眠等待状态，那么当前线程就不需要对它执行唤醒操作。当前正在处理的MessageQueue对象的成员变量mBlocked记录了目标线程是否正处于睡眠状态。如果它的值等于true，那么就表示目标线程正处于睡眠等待状态，这时候当前线程就需要将它唤醒。第17行代码将这个成员变量的值保存在变量needWake中，以便当前线程接下来可以决定是否需要将目标线程唤醒。
+
+&#8195;&#8195;将要发送的消息插入到目标消息队列中之后，第39行的if语句就检查变量needWake的值是否等于true。如果等于，那么接下来第31行就会调用MessageQueue的成员函数nativeWake将目标线程唤醒。
+
+&#8195;&#8195;假设目标线程正处于睡眠等待状态，接下来继续分析MessageQueue类的成员函数nativeWake的实现。
+
+**Step 3: MessageQueue.nativeWake**
+```C++
+frameworks/base/core/jni/android_os_MessageQueue.cpp
+01 static void android_os_MessageQueue_nativeWake(JNIEnv* env, jobject obj, jlong ptr, jint timeoutMillis) {
+02     NativeMessageQueue* nativeMessageQueue = reinterpret_cat<NativeMessageQueue*>(ptr);
+03     nativeMessageQueue->wake();
+04 }
+```
+
+**Step 4: NativeMessageQueue.wake**
+```C++
+frameworks/base/core/jni/android_os_MessageQueue.cpp
+01 void NativeMEssageQueue::wake(){
+02     mLooper->wake();
+03 }
+```
+
+&#8195;&#8195;NativeMessageQueue类的成员变量mLooper指向了一个C++层的Looper对象，第2行代码调用它的成员函数wake来唤醒目标线程，以便它可以处理它的消息队列中的新消息。
+
+**Step 5: Looper.wake**
+```C++
+system/core/libutils/Looper.cpp
+01 void Looper::wake() {
+02     ......
+03     
+04     uint64_t inc = 1;
+05     ssize_t nWrite = TEMP_FAILURE_RETRY(write(mWakeEventFd, &inc, sizeof(uint64_t)));
+06     if (nWrite != sizeof(uint64_t)) {
+07         if (errno != EAGAIN) {
+08             ALOGW("Could not write wake sigal, errno=%d", errno);
+09         }
+10     }
+11 }
+```
+
+&#8195;&#8195;从前面的内容可以知道，C++层的Looper类的成员变量mWakeEVentFd是用来描述epoll的读写描述。第5行代码调用函数write向它写入一个整型1，即向
 
 
