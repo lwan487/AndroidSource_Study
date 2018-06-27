@@ -693,6 +693,369 @@ system/core/libutils/Looper.cpp
 11 }
 ```
 
-&#8195;&#8195;从前面的内容可以知道，C++层的Looper类的成员变量mWakeEVentFd是用来描述epoll的读写描述。第5行代码调用函数write向它写入一个整型1，即向
+&#8195;&#8195;从前面的内容可以知道，C++层的Looper类的成员变量mWakeEVentFd是用来描述epoll的读写描述。第5行代码调用函数write向它写入一个整型1，即向它所描述的epoll写入一个新的消息，这时候目标线程就会因为这个管道发生了一个IO写事件而被唤醒。
+
+&#8195;&#8195;至此，一个线程消息发送过程就分析完成了。接下来，我们继续分析一个线程消息的处理过程。
+
+## 线程消息处理过程
+
+&#8195;&#8195;从前面的小结的内容可以知道，当一个线程没有新的消息需要处理时，它会在C++层的Looper类的成员函数pollInner中进入睡眠等待状态，因此，当这个线程有新的消息需要处理时，它首先会在C++层的Looper的成员函数pollInner中被唤醒，然后沿着之前的调用路径一直返回到java层的Looper类的静态成员loop中，最后就可以对新的消息进行处理了。
+
+&#8195;&#8195;接下来，我们从Java层的Looper类的静态成员函数loop开始，分析一下线程消息的处理过程，如下图所示：
+![image](https://note.youdao.com/yws/api/personal/file/F9E1D63B44D5451FBE3ACE9BEF10B22A?method=download&shareKey=6535953986f2acdbf9d2b83d1fda637f)
+
+&#8195;&#8195;这个过程一共分为3个步骤，下面就详细分析每一个步骤。
+
+**Step 1: Looper.loop**
+```java
+frameworks/base/core/java/android/os/Looper.java
+01 public class Looper {
+02     ......
+03     
+04     public static void loop() {
+05         final Looper me = myLooper();
+06         if (me == null) {
+07             throw new RuntimeException("No Looper; Looper.prepare() wasn't called on this thread.");
+08         }
+09         final MessageQueue queue = me.mQueue;
+10         
+11         // Make sure the identity of this thread is that of the local process,
+12         // and keep track of what that identity token actually is.
+13         Binder.clearCallingIdentity();
+14         final long ident = Binder.clearCallingIdentity();
+15         
+16         for (;;) {
+17             Message msg = queue.next(); // might block
+18             if (msg == null) {
+19                 // No message indicates that the message queue is quitting.
+20                 return;
+21             }
+22             
+23             // This must be in a local variable, in case a UI event sets the logger
+24             Printer logging = me.mLogging;
+25             if (logging != null) {
+26                 logging.println(">>>>> Dispatching to " + msg.target + " " + msg.callback + "：" + msg.what);
+27             }
+28             
+29             msg.target.dispatchMessage(msg);
+30             
+31             if (logging != null) {
+32                 logging.println("<<<<< Finished to " + msg.target + " " + msg.callback);
+33             }
+34             
+35             // Make sure that during the course of dispatching the 
+36             // identity of the thread wasn't corrupted.
+37             final long newIdent = Binder.clearCallingIdentity();
+38             if (ident != newIdent) {
+39                 Log.wtf(TAG, "Thread identity changed from 0x" 
+40                         + Long.toHexString(ident) + " to 0x" 
+41                         + Long.toHexString(newIdent) + " while dispatching to " 
+42                         + msg.target.getClass().getName() + " "
+43                         + msg.callback() + " what=" + msg.what);
+44             }
+45             
+46             msg.recycleUnchecked();
+47         }
+48     }
+49 }
+```
+
+&#8195;&#8195;第17行代码将要处理的消息保存在Message对象msg中，接着第18行的if语句检查这个Message对象的msg是否等于null。如果等于null，那么就说明要处理的是一个退出消息，因此，第20行代码就会退出消息循环；否则第29行代码就将这个消息分发给Message对象msg的成员变量target来处理。
+
+&#8195;&#8195;从前面可知，Message对象msg的成员变量target指向的是一个Handler对象，因此，接下来我们就继续分析Handler类的成员函数dispatchMessage的实现。
+
+**Step 2：Handler.dispatchMessage**
+```java
+framework/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     public void dispatchMessage(Message msg) {
+05         if (msg.callback != null) {
+06             handleCallback(msg);
+07         } else {
+08             if (mCallback != null) {
+09                 if (mCallback.handleMessage(msg)) {
+10                     return;
+11                 }
+12             }
+13             handleMessage(msg);
+14         }
+15     }
+16 }
+```
+
+&#8195;&#8195;Handler类的成员函数dispatchMessage按照以下顺序来分发一个消息。
+1. 如果要处理的消息在发送时就指定了一个回调接口，即第5行的if语句为true，那么第6行代码就会调用Handler类的成员函数handleCallback来处理这个消息。
+2. 如果条件1不满足，并且负责分发消息的Handler对象的成员变量mCallback指向一个回调接口，即第8行的if语句为true，那么第9行的if语句就会调用这个回调接口的成员函数handleMessage来处理这个消息。
+3. 如果条件2不满足，或者负责分发消息的Handler对象的成员变量mCallback所指向的一个回调接口希望这个消息可以继续向下处理，即第9行的if语句为false，那么第13行代码就会调用Handler类的成员函数handleMessage来处理这个消息。
+
+&#8195;&#8195;下面先分析前两种情况的消息处理过程，然后在Step 3中再分析第三种情况的消息处理过程。
+
+&#8195;&#8195;Handler类的成员函数handleCallback的实现如下所示。
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     private final void handleCallback(Message message) {
+05         message.callback.run();
+06     }
+07     
+08     ......
+09 }
+```
+&#8195;&#8195;第5行代码调用消息对象message的成员变量callback的成员函数run来处理一个消息。Message类的成员变量callback指向的是一个Runnable对象，因此，第5行代码实际上是将一个消息交给了Runnable类的成员函数run来处理。
+
+&#8195;&#8195;当调用Handler类的成员函数post来发送一个消息时，Handler类就会为这个消息置顶一个回调接口，如下所示：
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     public final boolean post(Runnable r) {
+05         return sendMessageDelayed(getPostMessage(r), 0);
+06     }
+07     
+08     ......
+09 }
+```
+
+&#8195;&#8195;参数r是一个类型为Runnable的对象，第6行代码在将它发送到一个消息队列之前，首先会调用Handler类的成员函数getPostManager将它分装成一个Message对象，这是因为消息队列只接收类型为Message的消息。
+
+&#8195;&#8195;Handler类的成员函数getPostMessage的实现如下所示：
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     private final Message getPostMessage(Runnable r) {
+05         Message m = Message.obtain();
+06         m.callback = r;
+07         return m;
+08     }
+09     
+10     ......
+11 }
+```
+
+&#8195;&#8195;第5行代码首先创建了一个空的消息对象，接着第6行代码将这个消息对象的成员变量callback设置为参数r所描述的一个Runnable对象。这样我们就可以将一个Runnable对象当作一个消息发送到一个消息队列中去处理，这个消息最终分发给这个Runnable对象的成员函数run来处理。
+
+&#8195;&#8195;Handler类在内部定义一个Callback接口，如下所示：
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     public interface Callback {
+05         public boolean handleMessage(Message msg);
+06     }
+07     
+08     ......
+09 }
+```
+
+&#8195;&#8195;这个接口只有一个成员函数handleMessage，它是用来处理一个消息的。
+
+&#8195;&#8195;除了可以使用Handler类的默认构造函数来创建一个Handler对象外，我们还可以使用Handler类的另外一个构造函数来创建一个Handler对象，这个构建函数需要指定一个实现了Callback接口对象，如下所示：
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     public Handler(Callback callback, boolean async) {
+05         ......
+06         
+07         mLooper = Looper.myLooper();
+08         ......
+09         mQueue = mLooper.mQueue;
+10         mCallback = callback;
+11         mAsynchronous = async;
+12     }
+13     
+14     ......
+15 }
+```
+
+&#8195;&#8195;第7行和第9行代码除了会将与当前线程所关联的一个Looper对象和一个MessageQueue对象保存在Handler类的成员变量mLooper和mQueue中之外，第10行代码还会降参数callback所描述的一个Callback对象保存在Handler类的成员变量mCallback中。
+
+&#8195;&#81956;这样就可以直接使用Handler类来发送消息，并且将这个消息交给一个实现了Callback接口的对象来处理。
+
+&#8195;&#8195;以上就是前两种情况的消息处理过程，接下来继续分析第三情况的消息处理情况，这是通过调用Handler类的成员函数handleMessage来实现的。
+
+**Step 3: Handler.handleMessage**
+```java
+frameworks/base/core/java/android/os/Handler.java
+01 public class Handler {
+02     ......
+03     
+04     /**
+05      * Subclasses must implement this to receive messages.
+06      */
+07     public void handleMessage(Message msg) {
+08     }
+09
+10     ......
+11 }
+```
+
+&#8195;&#8195;线程消息都有一个共同的特点，即它们都是先被发送到一个消息队列中，然后再从这个消息队列中取出来处理的。有一种特殊消息，它们不用事先发送到一个消息队列中，而是由一个线程在空闲的时候主动发送出来，这种特殊的线程消息称为线程空闲消息，接下来分析它的处理过程。
+
+&#8195;&#8195;线程空闲消息是由一种称为空闲消息处理器的对象来处理，这些空闲消息处理器必须要实现一个IdleHandler接口。
+
+&#8195;&#8195;IdleHandler接口的定义如下定义：
+```java
+frameworks/base/core/java/android/os/MessageQueue.java
+public class MessageQueue {
+    ......
+    
+    public static interface IdleHandler {
+        /**
+         * Called when the message queue has run out of messages and will now
+         * wait for more. Return true to keep your idle handler active, false
+         * to have it removed. This may be called if there are still messages
+         * pending in the queue, but they are all scheduled to be dispatched
+         * after the current time.
+         */
+         boolean queueIdle();
+    }
+    
+    ......
+}
+```
+
+&#8195;&#8195;它只有一个成员函数queueIdle，用来接收线程空闲消息。
+
+&#8195;&#8195;一个空闲消息处理器如果想要接收到一个线程的空闲消息，那么它就必须要注册到这个线程的消息队列中，即注册到与这个线程所关联的一个MessageQueue对象中。
+
+&#8195;&#8195;MessageQueue类有一个成员变量mIdleHandlers，它指向一个IdleHandler列表，用来保存空闲消息处理器，如下图所示：
+
+![image](https://note.youdao.com/yws/api/personal/file/5844F6859CA9408A924B5F7803C69767?method=download&shareKey=930a37ef3ba542befff71d7cfe716b29)
+
+&#8195;&#8195;MessageQueue类有两个成员函数addIdleHandler和remvoeIdleHandler，分别用来注册和注销一个空闲消息处理器，它们的实现如下所示：
+```java
+frameworks/base/core/java/android/os/MessageQueue.java
+public class MessageQueue {
+    ......
+    
+    public final void addIdleHandler(IdleHandler handler) {
+        if (handler == null) {
+            throw new NullPointerException("Can't add a null IdleHandler");
+        }
+        synchronized (this) {
+            mIdleHandlers.add(handler);
+        }
+    }
+    
+    public void removeIdleHandler(IdleHandler handler) {
+        synchronized(this){
+            mIdleHandlers.remove(handler);
+        }
+    }
+    
+    ......
+}
+```
+
+&#8195;&#8195;从前面的小结中可以知道，一个线程在消息循环的过程中，有时候会变得“无事可做”。当一个线程的消息队列为空，或者保存在消息队列头部的消息的处理时间大于系统的当前时间时，就会发生这种情况，这时候线程就处于一种空闲状态，接下来它就会进入睡眠等待状态。不过，在进入睡眠等待状态之前，这个线程会发出一个线程空闲消息给那些注册了的空闲消息处理器来处理。
+
+&#8195;&#8195;继续分析MessageQueue类的成员函数next的实现，以便可以了解线程空闲消息的处理过程。
+
+&#8195;&#8195;在MessageQueue类的成员函数next中，与线程空闲消息的相关的代码如下所示。
+
+```java
+frameworks/base/core/java/android/os/MessageQueue.java
+01 public class MessageQueue {
+02     ......
+03     
+04     Message next() {
+05         // Return here if the message loop has already quit and been disposed.
+06         // THis can happen if the application tries to restart a looper after quit
+07         // which is not supported
+08         final long ptr = mPtr;
+09         if (ptr == 0){
+10             return null;
+11         }
+12         
+13         int pendingIdleHandlerCount = -1; // -1 only during first iteration
+14         ......
+15         
+16         for (;;) {
+17             ......
+18             nativePollOnce(mPtr, nextPollTimeoutMillis);
+19             
+20             synchronized(this) {
+21                 ......
+22                 
+23                 // If first time idle, then get the number of idlers to run.
+24                 // Idle handles only run if the queue is empty or if the first message
+25                 // in the queue (possibly a barrier) is due to be handled in the future.
+26                 if (pendingIdleHandlerCount < 0
+27                         && (mMessage == null || now < mMesssage.when)) {
+28                     pendingIdleHandlerCount = mIdleHandlers.size();        
+29                 }
+30                 if (pendingIdleHandlerCount <= 0){
+31                     // No idle handlers to run. Loop and wait some more.
+32                     mBlocked = true;
+33                     continue;
+34                 }
+35                 if (mPendingIdleHandlers == null) {
+36                     mPendingIdleHandlers = new IdleHandler[Math.max(pendingIdleHandlerCount, 4)];
+37                 }
+38                 mPendingIdleHandlers = mIdleHandlers.toArray(mPendingIdleHandlers);
+39             }
+40             
+41             // Run the idle handlers.
+42             // We only ever reach this code block during the first iteration.
+43             for (int i = 0; i < pendingIdleHandlerCount; i++) {
+44                 final IdleHandler idler = mPendingIdleHandlers[i];
+45                 mPendingIdleHandlers[i] = null; // release the reference to the handler
+46                 
+47                 boolean keep = false;
+48                 try {
+49                     keep = idler.queueIdle();
+50                 } catch (Throwable t) {
+51                     Log.wtf(TAG, "IdleHandler threw exception", t);   
+52                 }
+53                 
+54                 if (!keep) {
+55                     synchronozed(this) {
+56                         mIdleHandlers.remove(idler);
+57                     }
+58                 }
+59             }
+60             
+61             // Reset the idle handler count to 0 so we do not run them again.
+62             pendingIdleHandlerCount = 0;
+63             
+64             // While calling an idle handler, a new message could have ben delivered
+65             // so go back and look again for a pending message without waiting.
+66             nextPollTimeoutMills = 0;
+67         }
+68     }
+69 }
+```
+
+&#8195;&#8195;当前线程执行到第16行的if语句时，就说明当前线程准备要进入睡眠等待状态了。
+
+&#8195;&#8195;第26行的if语句首先检查变量pendingIdleHandlerCount的值是否小于0并且mMessages为空或者mMessages的时间大于当前时间。如果为true，那么第28行代码就会获得所有注册到当前线程的消息队列中的空闲消息处理器的个数，并且保存在变量pendingIdleHandlerCount中。接着第30行的if语句再检查变量pendingIdleHandlerCount的值是否小于等于0。只有在两种情况下，变量pendingIdleHandlerCount的值才会等于0，其总，第一种情况是没有空闲消息处理器注册到当前线程的消息队列中；第二种情况是之前已经发送过一个线程空闲消息了。如果变量pendingIdleHandlerCount的值等于0，那么当前线程就不会再发出一个线程空闲消息了。
+
+&#8195;&#8195;从这里就可以看出，在MessageQueue类的成员函数next的一次调用中，一个线程最多只会发出一个线程空闲消息。
+
+```doc
+这并不意味着一个线程最多只会发出一个线程空闲消息，因为MessageQueue类的成员函数next在一个线程的消息循环过程中，会不断地被调用，而每一次调用都有可能发出一个线程空闲消息。
+```
+
+&#8195;&#8195;第35行到第38行代码首先将注册到当前线程的消息队列中的空闲消息处理器拷贝到一个空闲消息处理器数组mPendingIdleHandlers中，接着第43行到第59行的for循环再依次调用这个数组中的每一个空闲消息处理器的成员函数queueIdle来接收一个线程空闲消息。
+
+&#8195;&#8195;最后，第62行代码将变量pendingIdleHandlerCount的值重新设置为0，这样就可以保证在MessageQueue类的成员函数next的一次调用中，一个线程最多只会发出一个线程空闲消息。
+
+至此，一个线程空闲消息的处理过程就分析完成了。通过注册空闲消息处理器，我们就可以把一些不重要的或者不紧急的事情放在线程空闲的时候来执行，这样就可以充分地利用消息的空闲时间。
+
+
+
+
+
+
 
 
