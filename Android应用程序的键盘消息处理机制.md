@@ -1,0 +1,67 @@
+[TOC]
+&#8195;&#8195;在Android系统中，键盘事件是由系统来统一监控的，然后再以消息的形式分发给当前激活的应用程序窗口处理。键盘消息与普通消息的区别就在于前者是有硬件中断触发的，而后者则是由应用程序自己产生的。
+
+&#8195;&#8195;Android系统的键盘消息是统一由Window管理服务器WindowManagerService来管理的。Window管理服务WindowManagerService在启动时，会在内部创建一个输入管理器InputManager，用来监控系统的键盘事件。一个应用程序窗口如果需要接收键盘消息，那么它就必须在激活时与输入管理器InputManager建立一个连接，以便输入管理器InputManger可以将键盘消息分发给它处理。如果一个应用程序窗口在激活时与输入管理器InputManager之间的连接，那么当它销毁时，就必须要断开这个连接。应用程序窗口与输入管理器InputManager之间的连接是通过一对输入通道（InputChannel）来描述的，相应地，建立连接和断开连接的过程又分别称为注册InputChannel和注销InputChannel的过程。
+
+&#8195;&#8195;Android应用程序的键盘消息处理机制划分为五个部分的内容描述，如下所示：
+
+![image](https://note.youdao.com/yws/api/personal/file/58B55118F5C84FF8B0822DDF4DCC2166?method=download&shareKey=73a7e6b7ff3cbb7563938ad2809ac222)
+
+## 1、键盘消息处理模型
+&#8195;&#8195;从输入管理器InputManager开始分析Android应用程序键盘消息处理模型，实现如下所示：
+
+![image](https://note.youdao.com/yws/api/personal/file/A6DAE4228C06441A9272E9220B00D4F8?method=download&shareKey=9bd86965642a930c0cb39bcc87f10cbf)
+
+&#8195;&#8195;Window管理服务WindowManagerService内部有一个成员变量mInputManager，它指向了Android系统的输入管理器InputManagerService，是位于Java层中的对象。在C++层中，有一个NativeInputManager对象，它的成员变量mInputManager指向了C++层中的一个输入管理器InputManager。Java层中的输入管理器InputManager就是通过C++层中的输入管理器InputManager来监控系统的键盘事件的。
+
+&#8195;&#8195;C++层中的InputManager的两个成员变量mInputDispatcher和mInputReader，它们分别指向一个InputDispatcher对象和一个InputReader对象，其中，前者用来分发键盘事件给系统当前激活的应用程序窗口，而后者用来监控系统的键盘事件，它们分别运行在一个独立的线程中。
+
+&#8195;&#8195;InputDispatcher有两个成员变量mLooper和mFocusedWindow，它们分别指向了一个Looper对象和一个InputWindow对象，其中，前者用来和InputReader通信，而后者用来描述系统当前激活的应用程序窗口。
+
+&#8195;&#8195;当一个应用程序窗口被激活时，Window管理服务WindowManagerService就会调用Java层中的InputManager的成员函数setInputWindows将它设置到InputDispatcher的成员变量mFocusedWindow中，以便InputDispatcher可以将键盘事件分发给它处理。
+
+&#8195;&#8195;Java层中的InputManager的成员函数setInputWindows首先会将系统当前激活的应用程序窗口传递给NativeInputManager的成员函数setInputWindows，这样就可以将系统当前激活的应用程序窗口保存在InputDispatcher的成员变量mFocusedWindow中了。
+
+&#8195;&#8195;InputReader有一个成员变量mEventHub，它指向了一个EventHub对象，这个EventHub对象是真正用来监控系统的键盘事件的。
+
+&#8195;&#8195;Window管理服务WindowManagerService创建完成Java层中的InputManager之后，接着就会调用它的成员函数start来启动它。Java层中InputManager在启动的过程中，又会调用NativeInputManager的成员函数nativeStart，以便后者可以将C++层中的InputManager启动起来，这是通过调用它的成员函数start来实现的。
+
+&#8195;&#8195;C++层中的InputManager在启动的过程中，又会在内部创建两个线程，分别用来启动InputDispatcher和InputReader。
+
+&#8195;&#8195;InputDispatcher在启动完成之后，会不断调用它的成员函数dispatchOnce来检查InputReader是否给它分发一个键盘事件。如果没有，那么InputDispatcher就会通过调用它的成员变量mLooper的成员函数pollOnce进入睡眠等待状态，直到它被InputReader唤醒为止。
+
+&#8195;&#8195;InputReader在启动完成之后，会不断地调用它的成员函数loopOnce来监控系统是否有键盘事件发生。InputReader类的成员函数loopOnce实际上是通过调用成员变量mEventHub的成员函数getEvent来监控系统是否有键盘事件发生的。
+
+&#8195;&#8195;当系统发生了键盘事件时，InputReader就会从它的成员变量mEventHub的成员函数getEvent中返回来，接着再调用InputDispatcher的成员函数notiyKey来唤醒InputDispatcher，以便它可以将刚才发生的键盘事件分给系统当前激活的应用程序窗口处理。InputDispatcher类的成员函数notifyKey实际上是通过调用成员变量mLooper的成员函数wake将InputDispatcher唤醒的。
+
+&#8195;&#8195;应用程序窗口与输入管理器InputManager之间的连接模型如下所示：
+![image](https://note.youdao.com/yws/api/personal/file/FD3136F340E54DA8BD39632EA05C0FD7?method=download&shareKey=84a6e7d0ae8a0127186888ca160cd722)
+
+&#8195;&#8195;应用程序窗口通过注册两个InputChannel来与输入管理器InputManager建立连接，其中一个InputChannel称为Server端的InputChannel，而另外一个InputChannel称为Client端的InputChannel。Server端InputChannel需要注册在输入管理器InputManager中，而Client端InputChannel需要注册在应用程序主线程中。
+
+&#8195;&#8195;当系统有键盘事件发生时，输入管理器InputManager首先找到系统当前激活的应用程序窗口之前注册到它里面的一个Server端的InputChannel，接着再通过这个Server端的InputChannel将刚才发生的键盘事件发送给系统当前激活的应用程序窗口处理。
+
+&#8195;&#8195;系统当前激活的应用程序窗口在处理完成一个键盘事件之后，就会通过前面注册在应用程序主线程中的一个Client端InputManager发送一个键盘事件处理完成通知，以便输入管理的InputManager可以继续将接下来发生的其他键盘事件分发给系统当前激活的应用程序窗口处理。
+
+&#8195;&#8195;用来连接输入管理器InputManager和系统当前激活的应用程序窗口的InputChannel的实现如下：
+![image](https://note.youdao.com/yws/api/personal/file/870040F190994234B85E8ED291371496?method=download&shareKey=c9bb3bb71eb8124d926feb73135b7891)
+
+&#8195;&#8195;Java层中的InputChannel对象在创建时，会同时在C++ 层中创建一个NativeInputChannel对象，并且将这个NativeInputChannel对象的地址保存在它的成员变量mPtr中。C++ 层中的NativeInputChannel对象有一个成员变量mInputChannel，并指向了一个C++层中的InputChannel对象。
+
+&#8195;&#8195;C++ 层中的InputChannel对象包含一个文件描述符mFd。文件描述符mFd用来描述管道的读写事件，是用来在应用程序窗口与输入管理器InputManager之间建立交叉连接的。
+
+&#8195;&#8195;C++ 层中的InputWindow对象是用来描述一个应用程序窗口的，它有一个成员变量inputChannel，指向了C++ 层中的一个InputChannel对象，这样我们就可以将一个应用程序窗口与一个InputChannel关联起来。
+
+
+&#8195;&#8195;前面在介绍InputDispatcher时提到，它有一个类型为InputWindow的成员变量mFocusedWindow，指向了系统当前激活的应用程序窗口。当系统发生键盘事件时，InputDispatcher就会通过其成员变量mFocusedWindow得到与系统当前激活的应用程序窗口所关联的一个InputChannel，然后再通过这个InputChannel将刚才发生的键盘事件分发给系统当前激活的应用程序窗口处理。
+
+## 2、InputManager的启动过程
+&#8195;&#8195;Window管理服务WindowManagerService在启动时，会在内部创建一个InputManager，以便可以统一地管理系统的键盘事件。InputMaanger在创建的过程中，又会在内部创建一个InputDispatcher和一个InputReader，分别用来分发键盘事件给系统当前激活的应用程序窗口处理，以及监控系统键盘事件的发生。下面我们首先分析InputManager的创建和启动过程，然后分析InputDispatcher和InputReader的启动过程。
+
+### 2.1、创建InputManager
+
+### 2.2、启动InputManager
+
+### 2.3、启动InputDispatcher
+
+### 2.4、启动InputReader
