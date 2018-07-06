@@ -1,4 +1,3 @@
-[TOC]
 &#8195;&#8195;在Android系统中，键盘事件是由系统来统一监控的，然后再以消息的形式分发给当前激活的应用程序窗口处理。键盘消息与普通消息的区别就在于前者是有硬件中断触发的，而后者则是由应用程序自己产生的。
 
 &#8195;&#8195;Android系统的键盘消息是统一由Window管理服务器WindowManagerService来管理的。Window管理服务WindowManagerService在启动时，会在内部创建一个输入管理器InputManager，用来监控系统的键盘事件。一个应用程序窗口如果需要接收键盘消息，那么它就必须在激活时与输入管理器InputManager建立一个连接，以便输入管理器InputManger可以将键盘消息分发给它处理。如果一个应用程序窗口在激活时与输入管理器InputManager之间的连接，那么当它销毁时，就必须要断开这个连接。应用程序窗口与输入管理器InputManager之间的连接是通过一对输入通道（InputChannel）来描述的，相应地，建立连接和断开连接的过程又分别称为注册InputChannel和注销InputChannel的过程。
